@@ -262,7 +262,13 @@ document.getElementById('resetBtn').addEventListener('click', () => {
 });
 
 const DAY_PATTERNS = /^(sun|mon|mo|tue|wed|thu)/i;
-const CODE_PATTERN = /^\d{1,2}[A-Za-z](\/\d{1,2}[A-Za-z])?$/;
+const CODE_PATTERN = /^\d{1,2}[A-Za-z](\/\d{1,2}[A-Za-z])*$/;
+const TIME_PATTERN = /\d{1,2}:\d{2}/;
+// Text sizes in the aSc exports: class codes ~21-22pt, subject line and bottom subgroup code ~8-9pt,
+// custom lesson-time notes ~1-3pt. Compared as bands, not exact values.
+const MAIN_MIN = 15;
+const SMALL_MIN = 6;
+const CENTER_K = 0.335; // a text line's visual centre sits ~0.335 x font size above its baseline
 
 async function handleFiles(fileList) {
   const files = Array.from(fileList).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
@@ -319,12 +325,17 @@ async function extractPage(doc, pageNum, fileName) {
   const content = await page.getTextContent();
   const viewport = page.getViewport({ scale: 1 });
 
+  // Rotated text (the vertical BREAK / SALAT labels in LG files) is dropped: class codes are never rotated.
   const items = content.items.map(it => {
-    const x = it.transform[4];
-    const yBottom = it.transform[5];
-    const top = viewport.height - yBottom;
-    return { text: it.str.trim(), x0: x, x1: x + it.width, top };
-  }).filter(it => it.text.length > 0);
+    const t = it.transform;
+    const size = Math.hypot(t[2], t[3]);
+    const top = viewport.height - t[5]; // baseline, measured from the top of the page
+    return {
+      text: it.str.trim(), x0: t[4], x1: t[4] + it.width, top,
+      cx: t[4] + it.width / 2, cy: top - CENTER_K * size, size,
+      rotated: Math.abs(t[1]) > 0.01 || Math.abs(t[2]) > 0.01
+    };
+  }).filter(it => it.text.length > 0 && !it.rotated);
 
   const rows = groupRows(items);
 
@@ -332,48 +343,139 @@ async function extractPage(doc, pageNum, fileName) {
   const nameItem = items.find(it => /^teacher\b/i.test(it.text));
   const teacherName = nameItem ? nameItem.text.replace(/^teacher\s*/i, '').trim() : '(name not found)';
 
-  // Time row: row with 3+ items containing a HH:MM pattern
-  const timeRowIdx = rows.findIndex(r => r.items.filter(it => /\d{1,2}:\d{2}/.test(it.text)).length >= 3);
+  // Header row = the row just above the row of period times.
+  const timeRowIdx = rows.findIndex(r => r.items.filter(it => TIME_PATTERN.test(it.text)).length >= 3);
   if (timeRowIdx <= 0) throw new Error('Could not locate the period/time header row.');
   const headerRow = rows[timeRowIdx - 1];
 
-  const periodItems = headerRow.items.filter(it => /^\d+$/.test(it.text));
-  const periodCols = periodItems.map(it => (it.x0 + it.x1) / 2).sort((a, b) => a - b);
+  // Columns come from the header labels. "1".."8" are lesson periods; anything else
+  // (e.g. "BREAK 1", "SALAT" in LG files) is a non-lesson column and is never read as a class.
+  const heads = [];
+  for (const it of headerRow.items) {
+    const prev = heads[heads.length - 1];
+    if (prev && it.x0 - prev.x1 < 15) { prev.text += ' ' + it.text; prev.x1 = it.x1; }
+    else heads.push({ text: it.text, x0: it.x0, x1: it.x1 });
+  }
+  if (heads.length < 2) throw new Error('Could not read the period header row.');
+  const cols = heads.map(h => ({
+    label: h.text,
+    center: (h.x0 + h.x1) / 2,
+    period: /^\d+$/.test(h.text) ? parseInt(h.text, 10) : null
+  }));
+  const nC = cols.length;
+  const edges = [cols[0].center - (cols[1].center - cols[0].center) / 2];
+  for (let i = 0; i < nC - 1; i++) edges.push((cols[i].center + cols[i + 1].center) / 2);
+  edges.push(cols[nC - 1].center + (cols[nC - 1].center - cols[nC - 2].center) / 2);
+  const colW = (edges[nC] - edges[0]) / nC;
+  const colOf = cx => { for (let i = 0; i < nC; i++) if (cx >= edges[i] && cx < edges[i + 1]) return i; return -1; };
+  // A code centred on a column boundary is a double period (one cell merged across two columns).
+  const spanOf = cx => {
+    for (let b = 1; b < nC; b++) if (Math.abs(cx - edges[b]) < 0.25 * colW) return [b - 1, b];
+    return [colOf(cx)];
+  };
 
   const warnings = [];
-  if (periodCols.length < 6) warnings.push(`Only ${periodCols.length} period columns detected — expected around 8. Check this file manually.`);
+  const periodNums = cols.filter(c => c.period !== null).map(c => c.period);
+  const nP = periodNums.length ? Math.max(...periodNums) : 0;
+  if (periodNums.length < 6) warnings.push(`Only ${periodNums.length} period columns detected — expected around 8. Check this file manually.`);
+  if (periodNums.slice().sort((a, b) => a - b).some((n, i) => n !== i + 1)) warnings.push('Period numbers in the header are not 1, 2, 3… in sequence. Check this file manually.');
 
-  function nearestCols(cx, tol = 3) {
-    const diffs = periodCols.map((c, i) => ({ d: Math.abs(cx - c), i }));
-    diffs.sort((a, b) => a.d - b.d);
-    const [best, second] = diffs;
-    if (second && Math.abs(best.i - second.i) === 1) {
-      const mid = (periodCols[best.i] + periodCols[second.i]) / 2;
-      if (Math.abs(cx - mid) < tol) return [best.i, second.i].sort((a, b) => a - b);
+  // Rows come from the day labels in the left-hand column; each row is the band around its label.
+  const dayItems = items
+    .filter(it => it.cx < edges[0] && DAY_PATTERNS.test(it.text) && it.cy > headerRow.top)
+    .sort((a, b) => a.cy - b.cy);
+  if (!dayItems.length) {
+    warnings.push('No day rows detected — the file layout may differ from expected.');
+    return { fileName, pageNum, teacherName, periodCount: nP, grid: [], warnings };
+  }
+  const nD = dayItems.length;
+  if (nD !== 5) warnings.push(`${nD} day rows detected — expected 5 (Sunday to Thursday).`);
+  const rowH = nD > 1 ? (dayItems[nD - 1].cy - dayItems[0].cy) / (nD - 1) : 90;
+  const rowEdges = [dayItems[0].cy - rowH / 2];
+  for (let i = 0; i < nD - 1; i++) rowEdges.push((dayItems[i].cy + dayItems[i + 1].cy) / 2);
+  rowEdges.push(dayItems[nD - 1].cy + rowH / 2);
+  const rowOf = cy => { for (let i = 0; i < nD; i++) if (cy >= rowEdges[i] && cy < rowEdges[i + 1]) return i; return -1; };
+
+  // Sort every remaining piece of text into (day, column) and by size:
+  // large = class code line(s), small = subject line / bottom subgroup code.
+  const mains = [], smalls = [];
+  for (const it of items) {
+    if (TIME_PATTERN.test(it.text)) continue; // custom lesson-time notes
+    const r = rowOf(it.cy), c = colOf(it.cx);
+    if (r < 0 || c < 0) continue;             // title, header, footer, day labels
+    if (it.size >= MAIN_MIN) {
+      if (cols[c].period === null) {
+        if (CODE_PATTERN.test(it.text.replace(/^\/+|\/+$/g, ''))) warnings.push(`${dayItems[r].text}: class code "${it.text}" found under the "${cols[c].label}" column and not read.`);
+        continue;
+      }
+      mains.push({ ...it, r, c });
+    } else if (it.size >= SMALL_MIN) {
+      smalls.push({ ...it, r, c });
     }
-    return [best.i];
   }
 
-  const dayRows = rows.filter(r => r.items.some(it => it.x0 < 60 && DAY_PATTERNS.test(it.text)));
-  const grid = []; // {day, cells:[{value, merged, invalid}]}
-
-  for (const dr of dayRows) {
-    const dayLabelItem = dr.items.find(it => it.x0 < 60 && DAY_PATTERNS.test(it.text));
-    const dayLabel = dayLabelItem.text;
-    const codeItems = dr.items.filter(it => it.x0 >= 60 && !/^(english|electives)$/i.test(it.text));
-    const cells = new Array(periodCols.length).fill(null);
-    for (const it of codeItems) {
-      const cx = (it.x0 + it.x1) / 2;
-      const cols = nearestCols(cx);
-      const merged = cols.length > 1;
-      for (const c of cols) cells[c] = { value: it.text, merged, invalid: !CODE_PATTERN.test(it.text) };
+  // All large code lines in the same cell belong together. A stacked pair ("11F" over "11H", or
+  // "11F/" over "11H") is one combined class and is joined with a single "/".
+  const groups = new Map();
+  for (const m of mains) {
+    const span = spanOf(m.cx);
+    const key = m.r + ':' + span.join('-');
+    if (!groups.has(key)) groups.set(key, { r: m.r, span, lines: [], subjects: 0, bottoms: [], notes: [] });
+    groups.get(key).lines.push(m);
+  }
+  const list = [...groups.values()];
+  const owner = {};
+  for (const g of list) {
+    g.lines.sort((a, b) => a.cy - b.cy || a.x0 - b.x0);
+    g.parts = g.lines.map(l => l.text.replace(/^\/+|\/+$/g, '')).filter(Boolean);
+    g.value = g.parts.join('/');
+    g.label = 'P' + (g.span.map(c => cols[c].period).filter(p => p !== null).join('–P') || '?');
+    if (!CODE_PATTERN.test(g.value)) g.notes.push(`"${g.value}" doesn't look like a class code`);
+    if (g.span.some(c => cols[c].period === null)) g.notes.push('reaches into a BREAK/SALAT column');
+    for (const c of g.span) {
+      const k = g.r + ':' + c;
+      if (owner[k]) { g.notes.push('overlaps another class code in the same slot'); owner[k].notes.push('overlaps another class code in the same slot'); }
+      else owner[k] = g;
     }
-    grid.push({ day: dayLabel, cells });
   }
 
-  if (!grid.length) warnings.push('No day rows detected — the file layout may differ from expected.');
+  // Cross-checks on the small text: every cell needs a subject line, the bottom subgroup code (HG files)
+  // must be one of the class codes above it and sit in the cell's last column, and no text may float
+  // in a cell that has no class code.
+  const orphans = {};
+  for (const s of smalls) {
+    if (cols[s.c].period === null) continue;
+    const isCode = CODE_PATTERN.test(s.text);
+    const isWord = !isCode && /^[A-Za-z]/.test(s.text);
+    if (!isCode && !isWord) continue; // e.g. the "2" in "Room 2"
+    const g = owner[s.r + ':' + s.c];
+    if (!g) { const k = s.r + ':' + s.c; (orphans[k] = orphans[k] || { r: s.r, c: s.c, texts: [] }).texts.push(s.text); continue; }
+    if (isWord) g.subjects++; else g.bottoms.push(s);
+  }
+  for (const o of Object.values(orphans)) warnings.push(`${dayItems[o.r].text} P${cols[o.c].period}: text "${o.texts.join(' ')}" found but no class code in that cell.`);
+  for (const g of list) {
+    if (!g.subjects) g.notes.push('no subject line found in this cell');
+    for (const b of g.bottoms) {
+      if (!b.text.split('/').every(p => g.parts.join('/').split('/').includes(p))) g.notes.push(`bottom code "${b.text}" doesn't match "${g.value}"`);
+      else if (b.c !== g.span[g.span.length - 1]) g.notes.push(`bottom code "${b.text}" is in a different column from the end of this cell`);
+    }
+  }
 
-  return { fileName, pageNum, teacherName, periodCount: periodCols.length, grid, warnings };
+  // Build the grid (one entry per day, one cell per lesson period; a double period fills both periods).
+  const grid = dayItems.map(d => ({ day: d.text, cells: new Array(nP).fill(null) }));
+  for (const g of list) {
+    const invalid = g.notes.length > 0;
+    for (const n of new Set(g.notes)) warnings.push(`${dayItems[g.r].text} ${g.label}: ${n}.`);
+    for (const c of g.span) {
+      const p = cols[c].period;
+      if (p === null) continue;
+      const existing = grid[g.r].cells[p - 1];
+      if (existing) existing.invalid = true;
+      else grid[g.r].cells[p - 1] = { value: g.value, merged: g.span.length > 1, invalid };
+    }
+  }
+
+  return { fileName, pageNum, teacherName, periodCount: nP, grid, warnings };
 }
 
 function renderTeacher(result) {
@@ -382,7 +484,7 @@ function renderTeacher(result) {
 
   const anyInvalid = result.grid.some(r => r.cells.some(c => c && c.invalid));
   const allWarnings = [...result.warnings];
-  if (anyInvalid) allWarnings.push('One or more cells contain text that doesn\'t look like a class code (e.g. not like "5C" or "10A/10C") — highlighted below.');
+  if (anyInvalid) allWarnings.push('Highlighted cells failed a check — compare them with the PDF before pasting.');
 
   let html = `<div class="teacher-head">
     <div>
@@ -412,7 +514,7 @@ function renderTeacher(result) {
   html += `</tbody></table>`;
   html += `<div class="legend">
     <span><span class="swatch" style="background:var(--accent-soft)"></span> double period (merged in PDF)</span>
-    <span><span class="swatch" style="background:var(--warn-soft)"></span> unexpected code format &mdash; verify</span>
+    <span><span class="swatch" style="background:var(--warn-soft)"></span> failed a check &mdash; verify against the PDF</span>
   </div>`;
 
   card.innerHTML = html;
