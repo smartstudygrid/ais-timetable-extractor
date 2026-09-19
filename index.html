@@ -498,6 +498,7 @@ function renderTeacher(result) {
     html += `<div class="warnbar">${allWarnings.map(escapeHtml).join('<br>')}</div>`;
   }
 
+  const totalPeriods = result.grid.reduce((n, row) => n + row.cells.filter(Boolean).length, 0); // a double period counts as 2
   const periodHeaders = Array.from({ length: result.periodCount }, (_, i) => `P${i + 1}`);
   html += `<table class="grid"><thead><tr><th>Day</th>${periodHeaders.map(p => `<th>${p}</th>`).join('')}</tr></thead><tbody>`;
   for (const row of result.grid) {
@@ -515,6 +516,7 @@ function renderTeacher(result) {
   html += `<div class="legend">
     <span><span class="swatch" style="background:var(--accent-soft)"></span> double period (merged in PDF)</span>
     <span><span class="swatch" style="background:var(--warn-soft)"></span> failed a check &mdash; verify against the PDF</span>
+    <span style="margin-left:auto; color:var(--ink); font-weight:600;">Total periods this week: ${totalPeriods}</span>
   </div>`;
 
   card.innerHTML = html;
